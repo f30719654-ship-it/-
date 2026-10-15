@@ -1,49 +1,73 @@
 package com.example.bedaura.client;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.Environment;
 import net.fabricmc.api.EnvType;
-import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import org.lwjgl.glfw.GLFW;
 
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.Items;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.hit.BlockHitResult;
-import net.minecraft.item.Items;
-import net.minecraft.item.Item;
-import net.minecraft.item.ItemStack;
-import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.text.Text;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 
 @Environment(EnvType.CLIENT)
 public class BedAuraClient implements ClientModInitializer {
     private KeyBinding key;
     private final MinecraftClient mc = MinecraftClient.getInstance();
 
-    // state machine for multi-tick sequence
-    private int state = 0;
+    // config
+    private Config config = new Config();
+
+    // runtime state
+    private boolean enabled = false; // toggle mode
+    private boolean announced = false;
+    private int state = 0; // 0 idle, 1 place cobble, 2 place bed, 3 interact bed
     private int ticks = 0;
     private int prevHotbarSlot = -1;
     private int cobbleSlot = -1;
     private int bedSlot = -1;
     private BlockPos footPos = null;
-    private BlockPos headPos = null;
     private BlockPos cobblePos = null;
+    private int cooldown = 0;
+
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
     @Override
     public void onInitializeClient() {
         key = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "key.bed_aura.activate",
+                "key.bed_aura.toggle",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_V,
                 "category.bed_aura"
         ));
+
+        loadConfig();
+
+        // apply start_enabled from config
+        enabled = config.start_enabled;
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             try {
@@ -55,84 +79,152 @@ public class BedAuraClient implements ClientModInitializer {
         });
     }
 
+    private void loadConfig() {
+        try {
+            Path configDir = FabricLoader.getInstance().getConfigDir();
+            Path path = configDir.resolve("bed_aura.json");
+            if (Files.exists(path)) {
+                String json = Files.readString(path, StandardCharsets.UTF_8);
+                Config c = gson.fromJson(json, Config.class);
+                if (c != null) config = c;
+            } else {
+                // write default
+                Files.createDirectories(path.getParent());
+                Files.writeString(path, gson.toJson(config), StandardCharsets.UTF_8);
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void saveConfig() {
+        try {
+            Path configDir = FabricLoader.getInstance().getConfigDir();
+            Path path = configDir.resolve("bed_aura.json");
+            Files.writeString(path, gson.toJson(config), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
     private void tick() {
         if (mc.player == null || mc.world == null) {
             resetState();
             return;
         }
 
-        // start sequence on key press if not already running
-        if (key.wasPressed() && state == 0) {
-            HitResult hr = mc.crosshairTarget;
-            if (!(hr instanceof BlockHitResult)) {
-                // not looking at a block
-                return;
-            }
-            BlockHitResult bhr = (BlockHitResult) hr;
-            BlockPos target = bhr.getBlockPos();
-            Direction facing = mc.player.getHorizontalFacing();
+        // announce auto-start if enabled from config
+        if (enabled && !announced) {
+            mc.player.sendMessage(Text.of("Bed Aura: auto-start enabled"), true);
+            announced = true;
+        }
 
-            // Define foot/head positions: foot at the block you're looking at, head one block further in facing
-            footPos = target;
-            headPos = footPos.offset(facing);
+        // toggle key
+        while (key.wasPressed()) {
+            enabled = !enabled;
+            mc.player.sendMessage(Text.of("Bed Aura " + (enabled ? "enabled" : "disabled")), true);
+        }
 
-            // cobblestone placed between player and foot (toward player)
-            cobblePos = footPos.offset(facing.getOpposite());
+        if (!enabled) return;
 
-            // find cobble and bed in hotbar
-            PlayerInventory inv = mc.player.getInventory();
-            cobbleSlot = findHotbarSlot(inv, Items.COBBLESTONE);
-            bedSlot = findHotbarBedSlot(inv); // any bed
+        if (cooldown > 0) {
+            cooldown--;
+            return;
+        }
 
-            if (cobbleSlot == -1 || bedSlot == -1) {
-                // need both items in hotbar
-                mc.player.sendMessage(net.minecraft.text.Text.of("Put cobblestone and a bed in your hotbar!"), true);
+        // find target player in radius
+        Optional<PlayerEntity> opt = findTargetNearby(mc.player, config.radius);
+        if (opt.isEmpty()) return;
+        PlayerEntity target = opt.get();
+
+        // compute positions: foot at block target stands on, bed should face the target
+        BlockPos targetPos = target.getBlockPos();
+        // compute approximate facing from player to target
+        Vec3d tVec = target.getPos();
+        Vec3d meVec = mc.player.getPos();
+        double dx = tVec.x - meVec.x;
+        double dz = tVec.z - meVec.z;
+        Direction towardTarget;
+        if (Math.abs(dx) > Math.abs(dz)) {
+            towardTarget = dx > 0 ? Direction.WEST : Direction.EAST; // approximate
+        } else {
+            towardTarget = dz > 0 ? Direction.NORTH : Direction.SOUTH;
+        }
+
+        Direction bedFacing = target.getHorizontalFacing().getOpposite();
+        if (bedFacing == null) bedFacing = towardTarget;
+
+        BlockPos candidate = targetPos.offset(bedFacing);
+        footPos = candidate;
+        cobblePos = footPos.offset(bedFacing.getOpposite());
+
+        // ensure hotbar items
+        PlayerInventory inv = mc.player.getInventory();
+        cobbleSlot = findHotbarSlot(inv, Items.COBBLESTONE);
+        bedSlot = findHotbarBedSlot(inv);
+        if (cobbleSlot == -1 || bedSlot == -1) {
+            mc.player.sendMessage(Text.of("Bed Aura: put cobblestone and a bed in your hotbar!"), true);
+            enabled = false;
+            return;
+        }
+
+        prevHotbarSlot = inv.selectedSlot;
+        // start sequence
+        state = 1;
+        ticks = 0;
+
+        // run sequence across ticks
+        runStateMachine();
+    }
+
+    private void runStateMachine() {
+        ticks++;
+        switch (state) {
+            case 1:
+                if (ticks == 1) {
+                    setHotbarSlot(cobbleSlot);
+                    placeBlockAt(cobblePos);
+                } else if (ticks > config.delays.place_cobble_ticks) {
+                    state = 2;
+                    ticks = 0;
+                }
+                break;
+            case 2:
+                if (ticks == 1) {
+                    setHotbarSlot(bedSlot);
+                    placeBlockAt(footPos);
+                } else if (ticks > config.delays.place_bed_ticks) {
+                    state = 3;
+                    ticks = 0;
+                }
+                break;
+            case 3:
+                if (ticks == 1) {
+                    interactBlock(footPos);
+                } else if (ticks > config.delays.interact_bed_ticks) {
+                    restoreHotbar();
+                    resetState();
+                    cooldown = config.delays.sequence_cooldown_ticks;
+                }
+                break;
+            default:
                 resetState();
-                return;
-            }
-
-            prevHotbarSlot = inv.selectedSlot;
-            state = 1;
-            ticks = 0;
         }
+    }
 
-        // run state machine across ticks to sequence actions (allow server to process each interact)
-        if (state != 0) {
-            ticks++;
-            switch (state) {
-                case 1:
-                    // switch to cobble and place it at cobblePos
-                    if (ticks == 1) {
-                        setHotbarSlot(cobbleSlot);
-                        placeBlockAt(cobblePos);
-                    } else if (ticks > 4) {
-                        state = 2;
-                        ticks = 0;
-                    }
-                    break;
-                case 2:
-                    // switch to bed and place foot/head at footPos/headPos
-                    if (ticks == 1) {
-                        setHotbarSlot(bedSlot);
-                        // try to place bed foot at footPos
-                        placeBlockAt(footPos);
-                    } else if (ticks > 4) {
-                        state = 3;
-                        ticks = 0;
-                    }
-                    break;
-                case 3:
-                    // interact with bed (right click) to trigger explosion in End
-                    if (ticks == 1) {
-                        interactBlock(footPos);
-                    } else if (ticks > 4) {
-                        // restore hotbar and reset
-                        restoreHotbar();
-                        resetState();
-                    }
-                    break;
+    private Optional<PlayerEntity> findTargetNearby(PlayerEntity self, int radius) {
+        double bestDist = Double.MAX_VALUE;
+        PlayerEntity best = null;
+        for (PlayerEntity p : mc.world.getPlayers()) {
+            if (p == self) continue;
+            if (p.isSpectator() || p.isCreative()) continue;
+            double d = p.squaredDistanceTo(self);
+            if (d <= radius * radius && d < bestDist) {
+                bestDist = d;
+                best = p;
             }
         }
+        return Optional.ofNullable(best);
     }
 
     private void resetState() {
@@ -142,7 +234,6 @@ public class BedAuraClient implements ClientModInitializer {
         cobbleSlot = -1;
         bedSlot = -1;
         footPos = null;
-        headPos = null;
         cobblePos = null;
     }
 
@@ -180,8 +271,7 @@ public class BedAuraClient implements ClientModInitializer {
     private void setHotbarSlot(int slot) {
         if (mc.player == null) return;
         mc.player.getInventory().selectedSlot = slot;
-        // inform server by updating held item
-        mc.getNetworkHandler().sendPacket(new net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket(slot));
+        mc.getNetworkHandler().sendPacket(new UpdateSelectedSlotC2SPacket(slot));
     }
 
     private void placeBlockAt(BlockPos pos) {
@@ -200,5 +290,21 @@ public class BedAuraClient implements ClientModInitializer {
         BlockHitResult bhr = new BlockHitResult(hitVec, side, pos, false);
         mc.interactionManager.interactBlock(mc.player, mc.world, Hand.MAIN_HAND, bhr);
         mc.player.swingHand(Hand.MAIN_HAND);
+    }
+
+    // config classes
+    static class Config {
+        boolean start_enabled = true;
+        int radius = 6;
+        Delays delays = new Delays();
+        String mode = "auto"; // auto or manual
+        boolean destroy = true;
+    }
+
+    static class Delays {
+        int place_cobble_ticks = 2;
+        int place_bed_ticks = 2;
+        int interact_bed_ticks = 2;
+        int sequence_cooldown_ticks = 10;
     }
 }

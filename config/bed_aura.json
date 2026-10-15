@@ -1,0 +1,12 @@
+{
+  "start_enabled": true,
+  "radius": 6,
+  "delays": {
+    "place_cobble_ticks": 2,
+    "place_bed_ticks": 2,
+    "interact_bed_ticks": 2,
+    "sequence_cooldown_ticks": 10
+  },
+  "mode": "auto",
+  "destroy": true
+}
