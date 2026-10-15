@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "bed_aura_client",
+  "version": "1.0.0",
+  "name": "Bed Aura Client (simple)",
+  "description": "Client-side helper: places cobblestone and bed where you look and activates bed (End-only).",
+  "authors": ["f30719654-ship-it"],
+  "entrypoints": {
+    "client": [
+      "com.example.bedaura.client.BedAuraClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.14.25",
+    "fabric": "*",
+    "minecraft": "1.21.11"
+  }
+}
